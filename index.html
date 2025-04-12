@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>暗号化日記</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        .hidden { display: none; }
+        #diaryEntries div { border-bottom: 1px solid #eee; padding: 10px 0; }
+        #diaryEntries div:last-child { border-bottom: none; }
+        textarea { width: 95%; height: 150px; margin-bottom: 10px; }
+        button, input[type="file"], input[type="password"], input[type="text"] { margin: 5px; padding: 8px; }
+        .password-display { background-color: #f0f0f0; border: 1px solid #ccc; padding: 10px; margin-top: 10px; font-weight: bold; color: red;}
+        .error { color: red; margin-top: 10px; }
+        .entry-header { display: flex; justify-content: space-between; align-items: center; }
+        .entry-date { font-weight: bold; }
+        .edit-button { margin-left: 10px; }
+    </style>
+</head>
+<body>
+
+    <h1>暗号化日記</h1>
+
+    <div id="initialScreen">
+        <p>日記ファイルを作成しますか？ それとも既存のファイルを読み込みますか？</p>
+        <button onclick="showCreateScreen()">新しい日記ファイルを作成</button>
+        <button onclick="showLoadScreen()">既存の日記ファイルを読み込む</button>
+    </div>
+
+    <div id="createScreen" class="hidden">
+        <h2>新しい日記ファイルを作成</h2>
+        <p>日記ファイルを保護するためのパスワードを入力してください。このパスワードはファイル作成時に一度だけ表示されます。絶対に忘れないでください。</p>
+        <label for="createPassword">パスワード:</label>
+        <input type="password" id="createPassword">
+        <button onclick="createDiaryFile()">作成してダウンロード</button>
+        <div id="passwordDisplay" class="password-display hidden"></div>
+        <button onclick="showInitialScreen()">戻る</button>
+    </div>
+
+    <div id="loadScreen" class="hidden">
+        <h2>既存の日記ファイルを読み込む</h2>
+        <label for="diaryFile">日記ファイル (.diary):</label>
+        <input type="file" id="diaryFile" accept=".diary">
+        <br>
+        <label for="loadPassword">パスワード:</label>
+        <input type="password" id="loadPassword">
+        <button onclick="loadDiaryFile()">読み込む</button>
+        <div id="loadError" class="error hidden"></div>
+        <button onclick="showInitialScreen()">戻る</button>
+    </div>
+
+    <div id="mainScreen" class="hidden">
+        <h2>日記</h2>
+        <button onclick="showNewEntryEditor()">今日の日記を書く</button>
+        <button onclick="saveDiaryFile()">現在の日記をファイルに保存</button>
+        <button onclick="logout()">ファイルを閉じる（初期画面へ）</button>
+        <div id="saveMessage" style="color: green; margin-top: 10px;"></div>
+
+        <div id="entryEditor" class="hidden" style="margin-top: 20px;">
+            <h3 id="editorTitle"></h3>
+            <input type="hidden" id="editingDate" value="">
+            <textarea id="entryContent"></textarea>
+            <button onclick="saveEntry()">日記を保存</button>
+            <button onclick="cancelEdit()">キャンセル</button>
+        </div>
+
+        <div id="diaryEntries" style="margin-top: 20px;">
+            <h3>過去の日記</h3>
+            </div>
+    </div>
+
+    <script>
+        let diaryData = []; // { date: "YYYY-MM-DD", content: "..." }
+        let currentPassword = ''; // 復号/暗号化に使用するパスワード
+        let currentSalt; // 復号/暗号化に使用するSalt
+
+        const diaryFileName = "encrypted_diary.diary"; // ダウンロード時のデフォルトファイル名
+
+        // --- UI制御 ---
+        function showScreen(screenId) {
+            ['initialScreen', 'createScreen', 'loadScreen', 'mainScreen'].forEach(id => {
+                document.getElementById(id).classList.add('hidden');
+            });
+            document.getElementById(screenId).classList.remove('hidden');
+        }
+
+        function showInitialScreen() {
+            // 状態をリセット
+            diaryData = [];
+            currentPassword = '';
+            currentSalt = null;
+            document.getElementById('createPassword').value = '';
+            document.getElementById('loadPassword').value = '';
+            document.getElementById('diaryFile').value = '';
+            document.getElementById('passwordDisplay').classList.add('hidden');
+            document.getElementById('loadError').classList.add('hidden');
+            document.getElementById('entryEditor').classList.add('hidden');
+            document.getElementById('diaryEntries').innerHTML = '<h3>過去の日記</h3>'; // クリア
+            showScreen('initialScreen');
+        }
+
+        function showCreateScreen() {
+            showScreen('createScreen');
+        }
+
+        function showLoadScreen() {
+            showScreen('loadScreen');
+        }
+
+        function showMainScreen() {
+            // パスワード入力欄などをクリア
+            document.getElementById('loadPassword').value = '';
+            document.getElementById('diaryFile').value = '';
+            document.getElementById('loadError').classList.add('hidden');
+            document.getElementById('createPassword').value = '';
+            document.getElementById('passwordDisplay').classList.add('hidden');
+
+            document.getElementById('saveMessage').textContent = ''; // 保存メッセージをクリア
+            renderDiaryEntries();
+            showScreen('mainScreen');
+        }
+
+        function logout() {
+            if (confirm('現在の変更は保存されません（保存ボタンを押した場合を除く）。ファイルを閉じて初期画面に戻りますか？')) {
+                showInitialScreen();
+            }
+        }
+
+        // --- 暗号化/復号 (Web Crypto API) ---
+        // 文字列をUint8Arrayに変換
+        function strToUint8(str) {
+            return new TextEncoder().encode(str);
+        }
+
+        // Uint8Arrayを文字列に変換
+        function uint8ToStr(arr) {
+            return new TextDecoder().decode(arr);
+        }
+
+        // ArrayBufferをBase64文字列に変換
+        function bufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
+        }
+
+        // Base64文字列をArrayBufferに変換
+        function base64ToBuffer(base64) {
+            const binary_string = window.atob(base64);
+            const len = binary_string.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binary_string.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        // パスワードから暗号化キーを導出 (PBKDF2)
+        async function getKey(password, salt) {
+            const keyMaterial = await window.crypto.subtle.importKey(
+                'raw',
+                strToUint8(password),
+                'PBKDF2',
+                false,
+                ['deriveKey']
+            );
+            return window.crypto.subtle.deriveKey(
+                {
+                    "name": 'PBKDF2',
+                    salt: salt,
+                    "iterations": 100000, // 推奨される反復回数
+                    "hash": 'SHA-256'
+                },
+                keyMaterial,
+                { "name": 'AES-GCM', "length": 256 }, // AES-GCM用、256ビットキー
+                true,
+                [ "encrypt", "decrypt" ]
+            );
+        }
+
+        // データの暗号化 (AES-GCM)
+        async function encryptData(password, salt, data) {
+            const key = await getKey(password, salt);
+            const iv = window.crypto.getRandomValues(new Uint8Array(12)); // 96ビット IV
+            const encodedData = strToUint8(JSON.stringify(data));
+
+            const encryptedContent = await window.crypto.subtle.encrypt(
+                {
+                    name: 'AES-GCM',
+                    iv: iv
+                },
+                key,
+                encodedData
+            );
+
+            // Salt, IV, 暗号化データを結合して返す (Base64エンコード)
+            // 保存形式: salt(base64).iv(base64).encryptedData(base64)
+            return `${bufferToBase64(salt)}.${bufferToBase64(iv)}.${bufferToBase64(encryptedContent)}`;
+        }
+
+        // データの復号 (AES-GCM)
+        async function decryptData(password, encryptedString) {
+             try {
+                const parts = encryptedString.split('.');
+                if (parts.length !== 3) throw new Error("Invalid file format.");
+
+                const salt = base64ToBuffer(parts[0]);
+                const iv = base64ToBuffer(parts[1]);
+                const encryptedData = base64ToBuffer(parts[2]);
+
+                const key = await getKey(password, salt);
+
+                const decryptedContent = await window.crypto.subtle.decrypt(
+                    {
+                        name: 'AES-GCM',
+                        iv: iv
+                    },
+                    key,
+                    encryptedData
+                );
+
+                const decryptedStr = uint8ToStr(decryptedContent);
+                // 復号成功したらsaltを保持
+                currentSalt = salt;
+                return JSON.parse(decryptedStr);
+
+            } catch (error) {
+                console.error('Decryption failed:', error);
+                throw new Error('復号に失敗しました。パスワードが間違っているか、ファイルが破損しています。');
+            }
+        }
+
+
+        // --- ファイル操作 ---
+
+        // 新しい日記ファイルを作成してダウンロード
+        async function createDiaryFile() {
+            const password = document.getElementById('createPassword').value;
+            if (!password) {
+                alert('パスワードを入力してください。');
+                return;
+            }
+
+            // 初回なのでSaltを生成
+            const salt = window.crypto.getRandomValues(new Uint8Array(16));
+            currentSalt = salt; // Saltを保持
+            currentPassword = password; // パスワードを保持
+            diaryData = []; // 空の日記データ
+
+            try {
+                const encryptedString = await encryptData(currentPassword, currentSalt, diaryData);
+                downloadFile(encryptedString, diaryFileName);
+
+                // パスワードを表示（初回のみ）
+                const passwordDisplay = document.getElementById('passwordDisplay');
+                passwordDisplay.textContent = `作成されたパスワード: ${password} (この表示は一度だけです。必ず記録してください)`;
+                passwordDisplay.classList.remove('hidden');
+
+                // 少し経ったらメイン画面へ（ファイルダウンロードの時間を与える）
+                 setTimeout(() => {
+                    if(!passwordDisplay.classList.contains('hidden')){
+                         alert("パスワードを記録しましたか？\nOKを押すとメイン画面に進み、パスワード表示は消えます。");
+                    }
+                    // パスワード表示を消してメイン画面へ
+                    document.getElementById('passwordDisplay').classList.add('hidden');
+                    document.getElementById('createPassword').value = ''; // 入力欄もクリア
+                    showMainScreen();
+                 }, 3000); // 3秒待つ
+
+
+            } catch (error) {
+                console.error('Encryption failed:', error);
+                alert('暗号化中にエラーが発生しました。');
+            }
+        }
+
+        // 既存の日記ファイルを読み込み
+        function loadDiaryFile() {
+            const fileInput = document.getElementById('diaryFile');
+            const password = document.getElementById('loadPassword').value;
+            const errorDiv = document.getElementById('loadError');
+            errorDiv.classList.add('hidden'); // エラーメッセージをクリア
+
+            if (!fileInput.files || fileInput.files.length === 0) {
+                alert('日記ファイルを選択してください。');
+                return;
+            }
+            if (!password) {
+                alert('パスワードを入力してください。');
+                return;
+            }
+
+            const file = fileInput.files[0];
+            const reader = new FileReader();
+
+            reader.onload = async function(e) {
+                try {
+                    const encryptedString = e.target.result;
+                    const decryptedDiaryData = await decryptData(password, encryptedString);
+
+                    // 復号成功
+                    diaryData = decryptedDiaryData;
+                    currentPassword = password; // 成功したパスワードを保持
+                    // currentSalt は decryptData内で設定される
+                    showMainScreen();
+
+                } catch (error) {
+                    console.error('Load failed:', error);
+                    errorDiv.textContent = error.message;
+                    errorDiv.classList.remove('hidden');
+                    // 失敗したのでパスワードやファイル選択をクリアしない方が親切かもしれない
+                    // document.getElementById('loadPassword').value = '';
+                    // fileInput.value = ''; // ファイル選択をクリア
+                }
+            };
+
+            reader.onerror = function() {
+                console.error('File reading error');
+                 errorDiv.textContent = 'ファイルの読み込み中にエラーが発生しました。';
+                 errorDiv.classList.remove('hidden');
+            };
+
+            reader.readAsText(file); // テキストとして読み込む
+        }
+
+        // 現在の日記データをファイルとして保存（ダウンロード）
+        async function saveDiaryFile() {
+             if (!currentPassword || !currentSalt) {
+                alert('日記データが正しく読み込まれていないか、パスワードが設定されていません。');
+                return;
+            }
+            try {
+                // データを暗号化（IVは毎回新しく生成される）
+                const encryptedString = await encryptData(currentPassword, currentSalt, diaryData);
+                downloadFile(encryptedString, diaryFileName);
+                document.getElementById('saveMessage').textContent = `日記が ${diaryFileName} として保存されました。(ダウンロードが開始されます)`;
+                 // メッセージを数秒後に消す
+                setTimeout(() => {
+                    document.getElementById('saveMessage').textContent = '';
+                }, 5000);
+            } catch (error) {
+                 console.error('Save failed:', error);
+                 alert('日記の保存中にエラーが発生しました。');
+                 document.getElementById('saveMessage').textContent = '';
+            }
+        }
+
+        // ファイルダウンロード処理
+        function downloadFile(content, filename) {
+            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+
+        // --- 日記の表示と編集 ---
+
+        // 現在の日付を YYYY-MM-DD 形式で取得
+        function getCurrentDateString() {
+            const today = new Date();
+            const year = today.getFullYear();
+            const month = String(today.getMonth() + 1).padStart(2, '0');
+            const day = String(today.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        // 日記エントリをHTMLに描画
+        function renderDiaryEntries() {
+            const entriesContainer = document.getElementById('diaryEntries');
+            // 見出しを残して中身をクリア
+            entriesContainer.innerHTML = '<h3>過去の日記</h3>';
+
+            // 日付の降順でソートして表示
+            const sortedData = [...diaryData].sort((a, b) => b.date.localeCompare(a.date));
+
+            if (sortedData.length === 0) {
+                entriesContainer.innerHTML += '<p>まだ日記がありません。</p>';
+                return;
+            }
+
+            sortedData.forEach(entry => {
+                const entryDiv = document.createElement('div');
+                entryDiv.dataset.date = entry.date; // data属性で日付を保持
+
+                const header = document.createElement('div');
+                header.classList.add('entry-header');
+
+                const dateSpan = document.createElement('span');
+                dateSpan.classList.add('entry-date');
+                dateSpan.textContent = entry.date;
+                header.appendChild(dateSpan);
+
+                const editButton = document.createElement('button');
+                editButton.textContent = '編集';
+                editButton.classList.add('edit-button');
+                editButton.onclick = () => showEditEntryEditor(entry.date);
+                header.appendChild(editButton);
+
+                entryDiv.appendChild(header);
+
+                const contentP = document.createElement('p');
+                 // 改行を<br>に変換して表示
+                contentP.innerHTML = entry.content.replace(/\n/g, '<br>');
+                entryDiv.appendChild(contentP);
+
+                entriesContainer.appendChild(entryDiv);
+            });
+        }
+
+        // 新規日記作成エディタを表示
+        function showNewEntryEditor() {
+            const todayStr = getCurrentDateString();
+            document.getElementById('editorTitle').textContent = `今日の日記 (${todayStr})`;
+            document.getElementById('editingDate').value = todayStr; // 新規は今日の日付
+
+            // もし今日の日記が既にあれば、その内容を読み込む
+            const existingEntry = diaryData.find(entry => entry.date === todayStr);
+            document.getElementById('entryContent').value = existingEntry ? existingEntry.content : '';
+
+            document.getElementById('entryEditor').classList.remove('hidden');
+            document.getElementById('entryContent').focus();
+        }
+
+        // 既存日記の編集エディタを表示
+        function showEditEntryEditor(date) {
+            const entry = diaryData.find(e => e.date === date);
+            if (!entry) return;
+
+            document.getElementById('editorTitle').textContent = `日記の編集 (${date})`;
+            document.getElementById('editingDate').value = date; // 編集対象の日付
+            document.getElementById('entryContent').value = entry.content;
+            document.getElementById('entryEditor').classList.remove('hidden');
+            document.getElementById('entryContent').focus();
+             // エディタにスクロール
+            document.getElementById('entryEditor').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // エディタでの変更を保存
+        function saveEntry() {
+            const date = document.getElementById('editingDate').value;
+            const content = document.getElementById('entryContent').value;
+
+            if (!date) return; // 通常発生しないはず
+
+            // 既存のエントリを探す
+            const existingEntryIndex = diaryData.findIndex(entry => entry.date === date);
+
+            if (existingEntryIndex > -1) {
+                // 更新
+                diaryData[existingEntryIndex].content = content;
+            } else {
+                // 新規追加
+                diaryData.push({ date: date, content: content });
+            }
+
+            // エディタを非表示にし、リストを再描画
+            cancelEdit();
+            renderDiaryEntries();
+
+            // 保存を促すメッセージ（自動保存はしない）
+            document.getElementById('saveMessage').textContent = '日記が更新されました。変更を永続化するには「現在の日記をファイルに保存」ボタンを押してください。';
+             // メッセージを数秒後に消す
+            setTimeout(() => {
+                document.getElementById('saveMessage').textContent = '';
+             }, 7000);
+        }
+
+        // 編集をキャンセル
+        function cancelEdit() {
+            document.getElementById('entryEditor').classList.add('hidden');
+            document.getElementById('editingDate').value = '';
+            document.getElementById('entryContent').value = '';
+        }
+
+        // --- 初期化 ---
+        // ページ読み込み時に初期画面を表示
+        window.onload = showInitialScreen;
+
+    </script>
+
+</body>
+</html>
